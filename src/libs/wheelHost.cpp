@@ -43,6 +43,12 @@ constexpr uint64_t RenderRefreshNs   = 50'000'000;
 // A constant force the game has not updated for this long is held off: long enough not to cut a
 // force the game holds steady, short enough for a frozen game.
 constexpr uint64_t StaleForceNs = 2'000'000'000;
+// Some wheels stop an effect on their own (a firmware timeout, a mode change, a driver reset).
+// DirectInput's SetParameters does not start it again, only Start does, and an effect whose data
+// the game repeats unchanged is never uploaded again. Effects that should be playing are
+// therefore started again from time to time; doing so while one already runs is harmless, as
+// every effect sent here lasts until stopped.
+constexpr uint64_t ReassertIntervalNs = 1'000'000'000;
 // The rim's speed is measured over at least this long, and capped (half travels a second).
 constexpr uint64_t VelocityStepNs = 4'000'000;
 constexpr float    MaxVelocity    = 8.0f;
@@ -79,10 +85,12 @@ struct FfbFrame {
 
 struct SlotApplied {
 	Effect             effect;
-	bool               playing    = false;
-	uint64_t           generation = 0;
-	SDL_HapticEffectID sdl_id     = -1;
-	bool               software   = false;
+	bool               playing      = false;
+	uint64_t           generation   = 0;
+	SDL_HapticEffectID sdl_id       = -1;
+	bool               software     = false;
+	uint64_t           last_run_ns  = 0;
+	bool               run_failed   = false;
 };
 
 int16_t ReadAxisRaw(HostDevice& d, int index) {
@@ -224,7 +232,10 @@ private:
 	SDL_HapticEffectID                        m_render_id           = -1;
 	float                                     m_render_force        = 0.0f;
 	uint64_t                                  m_render_time         = 0;
+	uint64_t                                  m_render_run_ns       = 0;
 	bool                                      m_render_running      = false;
+	bool                                      m_render_run_failed   = false;
+	bool                                      m_reassert_noted      = false;
 	float                                     m_prev_position       = 0.0f;
 	float                                     m_velocity            = 0.0f;
 	uint64_t                                  m_prev_time           = 0;
@@ -699,8 +710,10 @@ void WheelHost::DestroySlot(SlotApplied* a) {
 	if (a->sdl_id >= 0 && m_haptic != nullptr) {
 		SDL_DestroyHapticEffect(m_haptic, a->sdl_id);
 	}
-	a->sdl_id   = -1;
-	a->software = false;
+	a->sdl_id      = -1;
+	a->software    = false;
+	a->last_run_ns = 0;
+	a->run_failed  = false;
 }
 
 void WheelHost::StopRender() {
@@ -708,6 +721,7 @@ void WheelHost::StopRender() {
 		SDL_StopHapticEffect(m_haptic, m_render_id);
 	}
 	m_render_running = false;
+	m_render_run_ns  = 0;
 	m_render_force   = 0.0f;
 }
 
@@ -867,7 +881,9 @@ bool WheelHost::ApplyFfbLocked(uint64_t now, const FfbFrame& frame, std::string*
 			a.effect   = r.effect;
 			if (a.sdl_id >= 0) {
 				if (want && (!a.playing || recreated)) {
-					SDL_RunHapticEffect(m_haptic, a.sdl_id, 1);
+					if (SDL_RunHapticEffect(m_haptic, a.sdl_id, 1)) {
+						a.last_run_ns = now;
+					}
 				} else if (!want && a.playing) {
 					SDL_StopHapticEffect(m_haptic, a.sdl_id);
 				}
@@ -876,6 +892,30 @@ bool WheelHost::ApplyFfbLocked(uint64_t now, const FfbFrame& frame, std::string*
 		}
 		if (a.playing && a.software) {
 			software++;
+		}
+	}
+
+	// A device can stop an effect on its own and never restart it. Starting the effects that
+	// should be playing again brings a stopped one back; one that still runs simply restarts.
+	if (!m_reassert_noted && m_haptic != nullptr) {
+		m_reassert_noted = true;
+		note("effects that should be playing are restarted every second, in case the device "
+		     "stopped one");
+	}
+	for (auto& a: m_applied) {
+		if (!a.playing || a.sdl_id < 0 || now - a.last_run_ns < ReassertIntervalNs) {
+			continue;
+		}
+		a.last_run_ns = now;
+		if (!SDL_RunHapticEffect(m_haptic, a.sdl_id, 1)) {
+			if (!a.run_failed) {
+				a.run_failed = true;
+				note(fmt::format("restarting {} failed: {}", EffectTypeName(a.effect.type),
+				                 SDL_GetError()));
+			}
+		} else if (a.run_failed) {
+			a.run_failed = false;
+			note(fmt::format("{} restarted", EffectTypeName(a.effect.type)));
 		}
 	}
 
@@ -926,8 +966,23 @@ bool WheelHost::ApplyFfbLocked(uint64_t now, const FfbFrame& frame, std::string*
 			m_render_time  = now;
 		}
 		if (m_render_id >= 0 && !m_render_running) {
-			SDL_RunHapticEffect(m_haptic, m_render_id, 1);
-			m_render_running = true;
+			if (SDL_RunHapticEffect(m_haptic, m_render_id, 1)) {
+				m_render_running = true;
+				m_render_run_ns  = now;
+			}
+		}
+		if (m_render_id >= 0 && m_render_running &&
+		    now - m_render_run_ns >= ReassertIntervalNs) {
+			m_render_run_ns = now;
+			if (!SDL_RunHapticEffect(m_haptic, m_render_id, 1)) {
+				if (!m_render_run_failed) {
+					m_render_run_failed = true;
+					note(fmt::format("restarting the computed force failed: {}", SDL_GetError()));
+				}
+			} else if (m_render_run_failed) {
+				m_render_run_failed = false;
+				note("the computed force restarted");
+			}
 		}
 	} else {
 		StopRender();
